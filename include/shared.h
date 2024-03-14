@@ -28,7 +28,6 @@
 #pragma GCC diagnostic ignored "-Wsign-conversion"
 
 #include <citrusleaf/alloc.h>
-#include <citrusleaf/cf_atomic.h>
 #include <citrusleaf/cf_b64.h>
 #include <citrusleaf/cf_clock.h>
 
@@ -45,7 +44,6 @@
 #include <aerospike/as_nil.h>
 #include <aerospike/as_node.h>
 #include <aerospike/as_policy.h>
-#include <aerospike/as_predexp.h>
 #include <aerospike/as_record.h>
 #include <aerospike/as_scan.h>
 

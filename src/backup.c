@@ -275,333 +275,31 @@ open_dir_file(per_node_context *pnc)
 	return true;
 }
 
-typedef struct cdt_fix_s {
-	const uint8_t *contents;
-	uint32_t content_sz;
-	uint32_t ele_count;
-	uint32_t nf_padding;
-
-	bool nf_list_order;
-
-	bool nf_map_order;
-	bool nf_map_dupkey;
-
-	bool need_log;
-} cdt_fix;
-
-static void
-cdt_check_set_cannotfix(const msgpack_in *mp, cdt_fix *cf, cdt_stats *stat)
-{
-	cf->need_log = true;
-	cf_atomic32_incr(&stat->cannot_fix);
-
-	if (mp->has_nonstorage) {
-		cf_atomic32_incr(&stat->cf_nonstorage);
-	}
-	else {
-		cf_atomic32_incr(&stat->cf_corrupt);
-	}
-}
-
-// Return true for need padding fix.
 static bool
-cdt_check_sz(msgpack_in *mp, uint32_t sz, cdt_fix *cf, cdt_stats *stat)
+map_is_key(const uint8_t *buf, uint32_t buf_sz)
 {
-	if (mp->offset < sz) {
-		cf->need_log = true;
-		cf_atomic32_incr(&stat->need_fix);
-		cf_atomic32_incr(&stat->nf_padding);
-		cf->nf_padding = sz - mp->offset;
+	msgpack_in mp = {
+			.buf = (uint8_t *)buf,
+			.buf_sz = buf_sz
+	};
+
+	msgpack_type type = msgpack_peek_type(&mp);
+
+	switch (type) {
+	case MSGPACK_TYPE_NEGINT:
+	case MSGPACK_TYPE_INT:
+	case MSGPACK_TYPE_STRING:
+		return true;
+	case MSGPACK_TYPE_BYTES: {
+		uint32_t len;
+		const uint8_t *b = msgpack_get_bin(&mp, &len);
+
+		if (b == NULL || len == 0 || *b != AS_BYTES_BLOB) {
+			break;
+		}
+
 		return true;
 	}
-
-	if (mp->offset > sz) {
-		cf_atomic32_incr(&stat->cannot_fix);
-		cf_atomic32_incr(&stat->cf_corrupt);
-	}
-
-	return false;
-}
-
-static bool
-cdt_map_dup_key_check(uint32_t ele_count, const uint8_t *contents,
-		uint32_t content_sz)
-{
-	if (ele_count <= 1) {
-		return false;
-	}
-
-	msgpack_in mp = {
-			.buf = contents,
-			.buf_sz = content_sz
-	};
-
-	// Simple O(n^2 / 2) check for dup keys.
-	for (uint32_t i = 0; i < ele_count - 1; i++) {
-		uint32_t cur_off = mp.offset;
-
-		msgpack_sz_rep(&mp, 2);
-
-		uint32_t next_off = mp.offset;
-		msgpack_in rhs = mp;
-
-		for (uint32_t j = i + 1; j < ele_count; j++) {
-			mp.offset = cur_off;
-
-			if (msgpack_cmp(&mp, &rhs) == MSGPACK_CMP_EQUAL) {
-				return true;
-			}
-		}
-
-		mp.offset = next_off;
-	}
-
-	return false;
-}
-
-// Return true for need fix.
-static bool
-cdt_map_need_fix(const uint8_t *buf, uint32_t sz, cdt_fix *cf,
-		backup_config *bc)
-{
-	msgpack_in mp = {
-			.buf = buf,
-			.buf_sz = sz
-	};
-
-	uint32_t ele_count;
-
-	if (! msgpack_get_map_ele_count(&mp, &ele_count)) {
-		cf->need_log = true;
-		cf_atomic32_incr(&bc->cdt_map.cannot_fix);
-		cf_atomic32_incr(&bc->cdt_map.cf_corrupt);
-		return false;
-	}
-
-	if (ele_count == 0) { // empty
-		cf->ele_count = ele_count;
-		cf->contents = mp.buf + mp.offset;
-		cf->content_sz = 0;
-		return cdt_check_sz(&mp, sz, cf, &bc->cdt_map);
-	}
-
-	msgpack_ext ext;
-
-	if (msgpack_peek_is_ext(&mp)) {
-		if (! msgpack_get_ext(&mp, &ext) || msgpack_sz(&mp) == 0) {
-			cf->need_log = true;
-			cf_atomic32_incr(&bc->cdt_map.cannot_fix);
-			cf_atomic32_incr(&bc->cdt_map.cf_corrupt);
-			return false; // corrupted ext
-		}
-	}
-	else { // not ordered
-		cf->ele_count = ele_count;
-		cf->contents = mp.buf + mp.offset;
-
-		if (msgpack_sz_rep(&mp, 2 * ele_count) == 0 || mp.has_nonstorage) {
-			cdt_check_set_cannotfix(&mp, cf, &bc->cdt_map);
-			return false;
-		}
-
-		cf->content_sz = (uint32_t)(mp.buf + mp.offset - cf->contents);
-
-		if (cdt_map_dup_key_check(ele_count, cf->contents, cf->content_sz)) {
-			cf->need_log = true;
-			cf_atomic32_incr(&bc->cdt_map.cannot_fix);
-			cf_atomic32_incr(&bc->cdt_map.cf_dupkey);
-			return false;
-		}
-
-		return cdt_check_sz(&mp, sz, cf, &bc->cdt_map);
-	}
-
-	cf->ele_count = ele_count - 1;
-	cf->contents = mp.buf + mp.offset;
-
-	if (cf->ele_count == 0) {
-		cf->content_sz = 0;
-		return cdt_check_sz(&mp, sz, cf, &bc->cdt_map);
-	}
-
-	msgpack_in mp_prev = mp;
-
-	if (msgpack_sz_rep(&mp, 2) == 0 || mp.has_nonstorage) {
-		cdt_check_set_cannotfix(&mp, cf, &bc->cdt_map);
-		return false;
-	}
-
-	for (uint32_t i = 1; i < ele_count - 1; i++) {
-		msgpack_cmp_type cmp = msgpack_cmp(&mp_prev, &mp);
-
-		if (msgpack_sz(&mp_prev) == 0 || msgpack_sz(&mp) == 0 ||
-				mp.has_nonstorage) {
-			cdt_check_set_cannotfix(&mp, cf, &bc->cdt_map);
-			return false;
-		}
-
-		if (cmp != MSGPACK_CMP_LESS) {
-			if (mp.has_nonstorage || (ele_count - i - 1 != 0 &&
-					(msgpack_sz_rep(&mp, 2 * (ele_count - i - 2)) == 0 ||
-							mp.has_nonstorage))) {
-				cdt_check_set_cannotfix(&mp, cf, &bc->cdt_map);
-				return false;
-			}
-
-			cf->content_sz = (uint32_t)(mp.buf + mp.offset - cf->contents);
-			cf->nf_map_order = true;
-
-			if (mp.offset <= sz) {
-				if (cdt_map_dup_key_check(ele_count, cf->contents,
-						cf->content_sz)) {
-					cf->need_log = true;
-					cf_atomic32_incr(&bc->cdt_map.cannot_fix);
-					cf_atomic32_incr(&bc->cdt_map.cf_dupkey);
-					return false;
-				}
-
-				cf_atomic32_incr(&bc->cdt_map.need_fix);
-				cf_atomic32_incr(&bc->cdt_map.nf_order);
-
-				if (mp.offset != sz) {
-					cf_atomic32_incr(&bc->cdt_map.nf_padding);
-					cf->nf_padding = sz - mp.offset;
-				}
-
-				return true; // fix order and maybe padding
-			}
-
-			cf->need_log = true;
-			cf_atomic32_incr(&bc->cdt_map.cannot_fix);
-			cf_atomic32_incr(&bc->cdt_map.cf_corrupt);
-			return false;
-		}
-	}
-
-	cf->content_sz = (uint32_t)(mp.buf + mp.offset - cf->contents);
-	return cdt_check_sz(&mp, sz, cf, &bc->cdt_map);
-}
-
-// Return true for need fix.
-static bool
-cdt_list_need_fix(const uint8_t *buf, uint32_t sz, cdt_fix *cf,
-		backup_config *bc)
-{
-	msgpack_in mp = {
-			.buf = buf,
-			.buf_sz = sz
-	};
-
-	uint32_t ele_count;
-
-	if (! msgpack_get_list_ele_count(&mp, &ele_count)) {
-		cf->need_log = true;
-		cf_atomic32_incr(&bc->cdt_list.cannot_fix);
-		cf_atomic32_incr(&bc->cdt_list.cf_corrupt);
-		return false;
-	}
-
-	if (ele_count == 0) { // empty
-		cf->ele_count = ele_count;
-		cf->contents = mp.buf + mp.offset;
-		cf->content_sz = 0;
-		return cdt_check_sz(&mp, sz, cf, &bc->cdt_list);
-	}
-
-	msgpack_ext ext;
-
-	if (msgpack_peek_is_ext(&mp)) {
-		if (! msgpack_get_ext(&mp, &ext)) {
-			cf->need_log = true;
-			cf_atomic32_incr(&bc->cdt_list.cannot_fix);
-			cf_atomic32_incr(&bc->cdt_list.cf_corrupt);
-			return false; // corrupted ext
-		}
-	}
-	else { // not ordered
-		cf->ele_count = ele_count;
-		cf->contents = mp.buf + mp.offset;
-
-		if (msgpack_sz_rep(&mp, ele_count) == 0 || mp.has_nonstorage) {
-			cdt_check_set_cannotfix(&mp, cf, &bc->cdt_list);
-			return false;
-		}
-
-		cf->content_sz = (uint32_t)(mp.buf + mp.offset - cf->contents);
-
-		return cdt_check_sz(&mp, sz, cf, &bc->cdt_list);
-	}
-
-	cf->ele_count = ele_count - 1;
-	cf->contents = mp.buf + mp.offset;
-
-	if (cf->ele_count == 0) {
-		cf->content_sz = 0;
-		return cdt_check_sz(&mp, sz, cf, &bc->cdt_list);
-	}
-
-	msgpack_in mp_prev = mp;
-
-	if (msgpack_sz_rep(&mp, 1) == 0 || mp.has_nonstorage) {
-		cdt_check_set_cannotfix(&mp, cf, &bc->cdt_list);
-		return false;
-	}
-
-	for (uint32_t i = 1; i < ele_count - 1; i++) {
-		msgpack_cmp_type cmp = msgpack_cmp(&mp_prev, &mp);
-
-		if (cmp != MSGPACK_CMP_LESS && cmp != MSGPACK_CMP_EQUAL) {
-			if (mp.has_nonstorage || (ele_count - i - 2 != 0 &&
-					(msgpack_sz_rep(&mp, ele_count - i - 2) == 0 ||
-							mp.has_nonstorage))) {
-				cdt_check_set_cannotfix(&mp, cf, &bc->cdt_list);
-				return false;
-			}
-
-			cf->content_sz = (uint32_t)(mp.buf + mp.offset - cf->contents);
-			cf->nf_list_order = true;
-
-			if (mp.offset <= sz) {
-				cf_atomic32_incr(&bc->cdt_list.need_fix);
-				cf_atomic32_incr(&bc->cdt_list.nf_order);
-
-				if (mp.offset != sz) {
-					cf_atomic32_incr(&bc->cdt_list.nf_padding);
-					cf->nf_padding = sz - mp.offset;
-				}
-
-				return true; // fix order and maybe padding
-			}
-
-			cf_atomic32_incr(&bc->cdt_list.cannot_fix);
-			cf_atomic32_incr(&bc->cdt_list.cf_corrupt);
-			return false;
-		}
-	}
-
-	if (mp.has_nonstorage) {
-		cf->need_log = true;
-		cf_atomic32_incr(&bc->cdt_list.cannot_fix);
-		cf_atomic32_incr(&bc->cdt_list.cf_nonstorage);
-		return false;
-	}
-
-	cf->content_sz = (uint32_t)(mp.buf + mp.offset - cf->contents);
-	return cdt_check_sz(&mp, sz, cf, &bc->cdt_list);
-}
-
-// Return true to need fix.
-static bool
-cdt_need_fix(const uint8_t *buf, uint32_t sz, cdt_fix *cf,
-		backup_config *bc)
-{
-	switch (msgpack_buf_peek_type(buf, sz)) {
-	case MSGPACK_TYPE_LIST:
-		cf_atomic32_incr(&bc->cdt_list.count);
-		return cdt_list_need_fix(buf, sz, cf, bc);
-	case MSGPACK_TYPE_MAP:
-		cf_atomic32_incr(&bc->cdt_map.count);
-		return cdt_map_need_fix(buf, sz, cf, bc);
 	default:
 		break;
 	}
@@ -609,83 +307,102 @@ cdt_need_fix(const uint8_t *buf, uint32_t sz, cdt_fix *cf,
 	return false;
 }
 
-extern bool
-as_cdt_add_packed(as_packer* pk, as_operations* ops, const as_bin_name name, as_operator op_type);
-
-static void
-cdt_fix_list(aerospike *as, as_record *rec, as_bin *bin, cdt_fix *cf,
-		cdt_stats *stat)
+static const uint8_t *
+check_map_keys_internal(const uint8_t *b, const uint8_t *end, backup_config *bc)
 {
-	if (! cf->nf_list_order && cf->nf_padding != 0) { // fix padding only
-		as_error error;
-		as_bytes *b = (as_bytes *)bin->valuep;
+	bool has_nonstorage = false;
+	bool not_compact = false;
+	uint32_t count = 1;
+	msgpack_type type;
+	const uint8_t *next_b = msgpack_parse(b, end, &count, &type,
+			&has_nonstorage, &not_compact);
+	uint32_t ele_count = count - 1;
 
-		as_bytes_truncate(b, cf->nf_padding);
+	switch (type) {
+	case MSGPACK_TYPE_LIST:
+		cf_atomic32_incr(&bc->cdt_list.count);
+		break;
+	case MSGPACK_TYPE_MAP:
+		cf_atomic32_incr(&bc->cdt_map.count);
+		break;
+	default:
+		return next_b;
+	}
 
-		if (aerospike_key_put(as, &error, NULL, &rec->key, rec) !=
-				AEROSPIKE_OK) {
-			err("aerospike_key_put() returned %d - %s", error.code, error.message);
-			cf_atomic32_incr(&stat->nf_failed);
-			return;
+	if (ele_count == 0) {
+		return next_b;
+	}
+
+	if (msgpack_buf_peek_type(next_b, (uint32_t)(end - next_b)) ==
+			MSGPACK_TYPE_EXT) {
+		msgpack_type type2;
+		next_b = msgpack_parse(next_b, end, &count, &type2, &has_nonstorage,
+				&not_compact);
+
+		if (type == MSGPACK_TYPE_MAP) {
+			next_b = msgpack_parse(next_b, end, &count, &type2, &has_nonstorage,
+					&not_compact);
+			ele_count--;
 		}
 
-		cf_atomic32_incr(&stat->fixed);
-		return;
+		ele_count--;
 	}
 
-	as_operations ops;
-	as_operations_init(&ops, 2);
+	if (type == MSGPACK_TYPE_LIST) {
+		for (uint32_t i = 0; i < ele_count; i++) {
+			if ((next_b = check_map_keys_internal(next_b, end, bc)) == NULL) {
+				cf_atomic32_incr(&bc->cdt_list.corrupt);
+				return NULL;
+			}
+		}
+	}
+	else { // MAPs
+		ele_count /= 2;
 
-	as_operations_add_list_clear(&ops, bin->name);
+		for (uint32_t i = 0; i < ele_count; i++) {
+			if (! map_is_key(next_b, (uint32_t)(end - next_b))) {
+				cf_atomic32_incr(&bc->cdt_map.invalid_key);
+				return NULL;
+			}
 
-	uint32_t new_buf_sz =
-			as_pack_list_header_get_size(4) + // OP list hdr
-			1 + // append items OP code
-			as_pack_list_header_get_size(cf->ele_count) + // value_list hdr
-			cf->content_sz + // value_list contents
-			1 + // create flags
-			1; // modify flags
+			if ((next_b = check_map_keys_internal(next_b, end, bc)) == NULL) {
+				cf_atomic32_incr(&bc->cdt_map.corrupt);
+				return NULL;
+			}
 
-	// add list append items
-	as_packer pk = {
-			.buffer = malloc(new_buf_sz),
-			.capacity = new_buf_sz
-	};
-
-	as_pack_list_header(&pk, 4);
-	as_pack_uint64(&pk, 2); // list append items OP code
-
-	as_pack_list_header(&pk, cf->ele_count);
-	memcpy(pk.buffer + pk.offset, cf->contents, cf->content_sz);
-	pk.offset += cf->content_sz;
-
-	as_pack_uint64(&pk, AS_LIST_ORDERED); // create flags
-	as_pack_uint64(&pk, AS_LIST_WRITE_ADD_UNIQUE | AS_LIST_WRITE_NO_FAIL | AS_LIST_WRITE_PARTIAL); // modify flags
-
-	if (! as_cdt_add_packed(&pk, &ops, bin->name, AS_OPERATOR_CDT_MODIFY)) {
-		err("as_cdt_add_packed() failed");
-		as_operations_destroy(&ops);
-		cf_atomic32_incr(&stat->nf_failed);
-		return;
+			if ((next_b = check_map_keys_internal(next_b, end, bc)) == NULL) {
+				cf_atomic32_incr(&bc->cdt_map.corrupt);
+				return NULL;
+			}
+		}
 	}
 
-	as_error error;
+	return next_b;
+}
 
-	if (aerospike_key_operate(as, &error, NULL, &rec->key, &ops, &rec) !=
-			AEROSPIKE_OK) {
-		err("as_testlist_op() returned %d - %s", error.code, error.message);
-		as_operations_destroy(&ops);
-		cf_atomic32_incr(&stat->nf_failed);
-		return;
+// Return true to need fix.
+static bool
+cdt_check_map_keys_recursive(const uint8_t *buf, uint32_t sz, backup_config *bc)
+{
+	switch (msgpack_buf_peek_type(buf, sz)) {
+	case MSGPACK_TYPE_LIST:
+		cf_atomic32_incr(&bc->cdt_list.top_count);
+		cf_atomic32_incr(&bc->cdt_list.count);
+		break;
+	case MSGPACK_TYPE_MAP:
+		cf_atomic32_incr(&bc->cdt_map.top_count);
+		cf_atomic32_incr(&bc->cdt_map.count);
+		break;
+	default:
+		return false;
 	}
 
-	as_operations_destroy(&ops);
-	cf_atomic32_incr(&stat->fixed);
+	return check_map_keys_internal(buf, buf + sz, bc) == NULL;
 }
 
 // Return true to log the record.
 static bool
-cdt_try_fix(aerospike *as, as_record *rec, backup_config *bc)
+cdt_check_map_keys(aerospike *as, as_record *rec, backup_config *bc)
 {
 	bool need_log = false; // log record if any bin is corrupt
 
@@ -706,25 +423,10 @@ cdt_try_fix(aerospike *as, as_record *rec, backup_config *bc)
 
 		uint8_t *buf = as_bytes_get(b);
 		uint32_t buf_sz = as_bytes_size(b);
-		cdt_fix cf = { NULL };
-		bool need_fix = cdt_need_fix(buf, buf_sz, &cf, bc);
+		bool check = cdt_check_map_keys_recursive(buf, buf_sz, bc);
 
-		if (cf.need_log) {
+		if (! check) {
 			need_log = true;
-		}
-
-		if (! need_fix) {
-			continue;
-		}
-
-		need_log = true;
-
-		if (! bc->cdt_fix) {
-			continue;
-		}
-
-		if (b_type == AS_BYTES_LIST) {
-			cdt_fix_list(as, rec, bin, &cf, &bc->cdt_list);
 		}
 	}
 
@@ -775,7 +477,7 @@ scan_callback(const as_val *val, void *cont)
 
 	cf_atomic64_incr(&pnc->conf->rec_count_checked);
 
-	if (! cdt_try_fix(pnc->conf->as, rec, pnc->conf)) {
+	if (! cdt_check_map_keys(pnc->conf->as, rec, pnc->conf)) {
 		return true;
 	}
 
@@ -1060,27 +762,15 @@ counter_thread_func(void *cont)
 		err_code("Error while writing machine-readable summary");
 	}
 
-	inf("CDT Mode: %s", conf->cdt_fix ? "fix" : "validate");
+	inf("CDT States");
 	inf("%10u Lists", conf->cdt_list.count);
-	inf("%10u   Unfixable", conf->cdt_list.cannot_fix);
-	inf("%10u     Has non-storage", conf->cdt_list.cf_nonstorage);
-	inf("%10u     Corrupted", conf->cdt_list.cf_corrupt);
-	inf("%10u   Need Fix", conf->cdt_list.need_fix);
-	inf("%10u     Fixed", conf->cdt_list.fixed);
-	inf("%10u     Fix failed", conf->cdt_list.nf_failed);
-	inf("%10u     Order", conf->cdt_list.nf_order);
-	inf("%10u     Padding", conf->cdt_list.nf_padding);
+	inf("%10u   Top-level Count", conf->cdt_list.top_count);
+	inf("%10u   Corrupted", conf->cdt_list.corrupt);
 
 	inf("%10u Maps", conf->cdt_map.count);
-	inf("%10u   Unfixable", conf->cdt_map.cannot_fix);
-	inf("%10u     Has duplicate keys", conf->cdt_map.cf_dupkey);
-	inf("%10u     Has non-storage", conf->cdt_map.cf_nonstorage);
-	inf("%10u     Corrupted", conf->cdt_map.cf_corrupt);
-	inf("%10u   Need Fix", conf->cdt_map.need_fix);
-	inf("%10u     Fixed", conf->cdt_map.fixed);
-	inf("%10u     Fix failed", conf->cdt_map.nf_failed);
-	inf("%10u     Order", conf->cdt_map.nf_order);
-	inf("%10u     Padding", conf->cdt_map.nf_padding);
+	inf("%10u   Top-level Count", conf->cdt_map.top_count);
+	inf("%10u   Corrupted", conf->cdt_map.corrupt);
+	inf("%10u   Invalid-key", conf->cdt_map.invalid_key);
 
 	if (verbose) {
 		ver("Leaving counter thread");
@@ -1669,8 +1359,8 @@ usage(const char *name)
 	fprintf(stderr, "                      Remove existing output file (-o) or files (-d).\n");
 	fprintf(stderr, "                      NOT allowed in configuration file\n");
 
-	fprintf(stderr, " --cdt-fix-ordered-list-unique\n");
-	fprintf(stderr, "                      Fix CDT ordered list records.\n");
+//	fprintf(stderr, " --cdt-fix-ordered-list-unique\n");
+//	fprintf(stderr, "                      Fix CDT ordered list records.\n");
 
 	fprintf(stderr, "\n");
 	fprintf(stderr, "Configuration File Allowed Options\n");
@@ -1791,16 +1481,16 @@ usage(const char *name)
 	fprintf(stderr,"                       typically a FIFO.\n");
 	fprintf(stderr, "  -N, --nice <bandwidth>\n");
 	fprintf(stderr, "                      The limit for write storage bandwidth in MiB/s.\n");
-	fprintf(stderr, "  -a, --modified-after <YYYY-MM-DD_HH:MM:SS>\n");
-	fprintf(stderr, "                      Perform an incremental validation; only include records \n");
-	fprintf(stderr, "                      that changed after the given date and time. The system's \n");
-	fprintf(stderr, "                      local timezone applies. If only HH:MM:SS is specified, then\n");
-	fprintf(stderr, "                      today's date is assumed as the date. If only YYYY-MM-DD is \n");
-	fprintf(stderr, "                      specified, then 00:00:00 (midnight) is assumed as the time.\n");
-	fprintf(stderr, "  -b, --modified-before <YYYY-MM-DD_HH:MM:SS>\n");
-	fprintf(stderr, "                      Only include records that last changed before the given\n");
-	fprintf(stderr, "                      date and time. May combined with --modified-after to specify\n");
-	fprintf(stderr, "                      a range.\n\n");
+//	fprintf(stderr, "  -a, --modified-after <YYYY-MM-DD_HH:MM:SS>\n");
+//	fprintf(stderr, "                      Perform an incremental validation; only include records \n");
+//	fprintf(stderr, "                      that changed after the given date and time. The system's \n");
+//	fprintf(stderr, "                      local timezone applies. If only HH:MM:SS is specified, then\n");
+//	fprintf(stderr, "                      today's date is assumed as the date. If only YYYY-MM-DD is \n");
+//	fprintf(stderr, "                      specified, then 00:00:00 (midnight) is assumed as the time.\n");
+//	fprintf(stderr, "  -b, --modified-before <YYYY-MM-DD_HH:MM:SS>\n");
+//	fprintf(stderr, "                      Only include records that last changed before the given\n");
+//	fprintf(stderr, "                      date and time. May combined with --modified-after to specify\n");
+//	fprintf(stderr, "                      a range.\n\n");
 
 	fprintf(stderr, "\n\n");
 	fprintf(stderr, "Default configuration files are read from the following files in the given order:\n");
@@ -1836,7 +1526,7 @@ main(int32_t argc, char **argv)
 		{ "no-config-file", no_argument, 0, CONFIG_FILE_OPT_NO_CONFIG_FILE},
 		{ "only-config-file", required_argument, 0, CONFIG_FILE_OPT_ONLY_CONFIG_FILE},
 
-		{ "cdt-fix-ordered-list-unique", no_argument, NULL, CDT_FIX_OPT },
+//		{ "cdt-fix-ordered-list-unique", no_argument, NULL, CDT_FIX_OPT },
 
 		// Config options
 		{ "host", required_argument, 0, 'h'},
@@ -1882,8 +1572,8 @@ main(int32_t argc, char **argv)
 		{ "file-limit", required_argument, NULL, 'F' },
 		{ "remove-files", no_argument, NULL, 'r' },
 		{ "node-list", required_argument, NULL, 'l' },
-		{ "modified-after", required_argument, NULL, 'a' },
-		{ "modified-before", required_argument, NULL, 'b' },
+//		{ "modified-after", required_argument, NULL, 'a' },
+//		{ "modified-before", required_argument, NULL, 'b' },
 		{ "records-per-second", required_argument, NULL, 'L' },
 		{ "machine", required_argument, NULL, 'm' },
 		{ "nice", required_argument, NULL, 'N' },
@@ -2165,21 +1855,21 @@ main(int32_t argc, char **argv)
 			conf.tls.certfile = safe_strdup(optarg);
 			break;
 
-		case 'a':
-			if (!parse_date_time(optarg, &conf.mod_after)) {
-				err("Invalid date and time string %s", optarg);
-				goto cleanup1;
-			}
-
-			break;
-
-		case 'b':
-			if (!parse_date_time(optarg, &conf.mod_before)) {
-				err("Invalid date and time string %s", optarg);
-				goto cleanup1;
-			}
-
-			break;
+//		case 'a':
+//			if (!parse_date_time(optarg, &conf.mod_after)) {
+//				err("Invalid date and time string %s", optarg);
+//				goto cleanup1;
+//			}
+//
+//			break;
+//
+//		case 'b':
+//			if (!parse_date_time(optarg, &conf.mod_before)) {
+//				err("Invalid date and time string %s", optarg);
+//				goto cleanup1;
+//			}
+//
+//			break;
 
 		case CONFIG_FILE_OPT_FILE:
 		case CONFIG_FILE_OPT_INSTANCE:
@@ -2187,9 +1877,9 @@ main(int32_t argc, char **argv)
 		case CONFIG_FILE_OPT_ONLY_CONFIG_FILE:
 			break;
 
-		case CDT_FIX_OPT:
-			conf.cdt_fix = true;
-			break;
+//		case CDT_FIX_OPT:
+//			conf.cdt_fix = true;
+//			break;
 
 		default:
 			usage(argv[0]);
@@ -2270,54 +1960,9 @@ main(int32_t argc, char **argv)
 	signal(SIGINT, sig_hand);
 	signal(SIGTERM, sig_hand);
 
-	const char *before;
-	const char *after;
-	char before_buff[100];
-	char after_buff[100];
-
-	if (conf.mod_before > 0 && conf.mod_after > 0) {
-		as_scan_predexp_inita(&scan, 7);
-	} else if (conf.mod_before > 0 || conf.mod_after > 0) {
-		as_scan_predexp_inita(&scan, 3);
-	}
-
-	if (conf.mod_before > 0) {
-		as_scan_predexp_add(&scan, as_predexp_rec_last_update());
-		as_scan_predexp_add(&scan, as_predexp_integer_value(conf.mod_before));
-		as_scan_predexp_add(&scan, as_predexp_integer_less());
-
-		if (!format_date_time(conf.mod_before, before_buff, sizeof before_buff)) {
-			err("Error while formatting modified-since time");
-			goto cleanup2;
-		}
-
-		before = before_buff;
-	} else {
-		before = "[none]";
-	}
-
-	if (conf.mod_after > 0) {
-		as_scan_predexp_add(&scan, as_predexp_rec_last_update());
-		as_scan_predexp_add(&scan, as_predexp_integer_value(conf.mod_after));
-		as_scan_predexp_add(&scan, as_predexp_integer_greatereq());
-
-		if (!format_date_time(conf.mod_after, after_buff, sizeof after_buff)) {
-			err("Error while formatting modified-since time");
-			goto cleanup2;
-		}
-
-		after = after_buff;
-	} else {
-		after = "[none]";
-	}
-
-	if (conf.mod_before > 0 && conf.mod_after > 0) {
-		as_scan_predexp_add(&scan, as_predexp_and(2));
-	}
-
-	inf("Starting validation of %s (namespace: %s, set: %s, bins: %s, after: %s, before: %s) to %s",
+	inf("Starting validation of %s (namespace: %s, set: %s, bins: %s) to %s",
 			conf.host, scan.ns, scan.set[0] == 0 ? "[all]" : scan.set,
-			conf.bin_list == NULL ? "[all]" : conf.bin_list, after, before,
+			conf.bin_list == NULL ? "[all]" : conf.bin_list,
 			conf.output_file != NULL ?
 					strcmp(conf.output_file, "-") == 0 ? "[stdout]" : conf.output_file :
 					conf.directory != NULL ?
@@ -2619,8 +2264,6 @@ config_default(backup_config *conf)
 	conf->remove_files = false;
 	conf->bin_list = NULL;
 	conf->node_list = NULL;
-	conf->mod_after = 0;
-	conf->mod_before = 0;
 	conf->directory = NULL;
 	conf->output_file = NULL;
 	conf->compact = false;

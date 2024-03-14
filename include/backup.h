@@ -51,19 +51,19 @@ typedef struct {
 	bool (*put_record)(uint64_t *bytes, FILE *fd, bool compact, const as_record *rec);
 } backup_encoder;
 
+#define cf_atomic32 uint32_t
+#define cf_atomic64 uint64_t
+#define cf_atomic64_get(x) as_load_seq(&x)
+#define cf_atomic32_incr(x) as_faa_seq(x, 1)
+#define cf_atomic64_incr(x) as_faa_seq(x, 1)
+#define cf_atomic64_add as_faa_seq
+#define cf_atomic64_set as_store_seq
+
 typedef struct cdt_stats_s {
+	cf_atomic32 top_count;
 	cf_atomic32 count;
-	cf_atomic32 fixed;
-
-	cf_atomic32 need_fix;
-	cf_atomic32 nf_failed;
-	cf_atomic32 nf_order;
-	cf_atomic32 nf_padding;
-
-	cf_atomic32 cannot_fix;
-	cf_atomic32 cf_dupkey; // map only
-	cf_atomic32 cf_nonstorage;
-	cf_atomic32 cf_corrupt;
+	cf_atomic32 corrupt;
+	cf_atomic32 invalid_key; // map only
 } cdt_stats;
 
 ///
@@ -78,8 +78,6 @@ typedef struct {
 	bool remove_files;
 	char *bin_list;
 	char *node_list;
-	int64_t mod_after;
-	int64_t mod_before;
 
 	as_config_tls tls;
 
@@ -110,7 +108,7 @@ typedef struct {
 	                                    ///  raise the limit according to the bandwidth limit.
 	char *auth_mode;					///< Authentication mode
 
-	bool cdt_fix;
+//	bool cdt_fix;
 
 	cdt_stats cdt_list;
 	cdt_stats cdt_map;
