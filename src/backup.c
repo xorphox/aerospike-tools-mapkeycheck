@@ -308,7 +308,8 @@ map_is_key(const uint8_t *buf, uint32_t buf_sz)
 }
 
 static const uint8_t *
-check_map_keys_internal(const uint8_t *b, const uint8_t *end, backup_config *bc)
+check_map_keys_internal(const uint8_t *b, const uint8_t *end, cdt_stats *st,
+		int level)
 {
 	bool has_nonstorage = false;
 	bool not_compact = false;
@@ -318,12 +319,21 @@ check_map_keys_internal(const uint8_t *b, const uint8_t *end, backup_config *bc)
 			&has_nonstorage, &not_compact);
 	uint32_t ele_count = count - 1;
 
+	if (next_b == NULL) {
+		cf_atomic32_incr(&st->corrupt);
+		return NULL;
+	}
+
 	switch (type) {
 	case MSGPACK_TYPE_LIST:
-		cf_atomic32_incr(&bc->cdt_list.count);
+		if (level != 0) {
+			cf_atomic32_incr(&st->list_count);
+		}
 		break;
 	case MSGPACK_TYPE_MAP:
-		cf_atomic32_incr(&bc->cdt_map.count);
+		if (level != 0) {
+			cf_atomic32_incr(&st->map_count);
+		}
 		break;
 	default:
 		return next_b;
@@ -339,10 +349,20 @@ check_map_keys_internal(const uint8_t *b, const uint8_t *end, backup_config *bc)
 		next_b = msgpack_parse(next_b, end, &count, &type2, &has_nonstorage,
 				&not_compact);
 
+		if (next_b == NULL) {
+			cf_atomic32_incr(&st->corrupt);
+			return NULL;
+		}
+
 		if (type == MSGPACK_TYPE_MAP) {
 			next_b = msgpack_parse(next_b, end, &count, &type2, &has_nonstorage,
 					&not_compact);
 			ele_count--;
+
+			if (next_b == NULL) {
+				cf_atomic32_incr(&st->corrupt);
+				return NULL;
+			}
 		}
 
 		ele_count--;
@@ -350,8 +370,9 @@ check_map_keys_internal(const uint8_t *b, const uint8_t *end, backup_config *bc)
 
 	if (type == MSGPACK_TYPE_LIST) {
 		for (uint32_t i = 0; i < ele_count; i++) {
-			if ((next_b = check_map_keys_internal(next_b, end, bc)) == NULL) {
-				cf_atomic32_incr(&bc->cdt_list.corrupt);
+			next_b = check_map_keys_internal(next_b, end, st, level + 1);
+
+			if (next_b == NULL) {
 				return NULL;
 			}
 		}
@@ -361,17 +382,19 @@ check_map_keys_internal(const uint8_t *b, const uint8_t *end, backup_config *bc)
 
 		for (uint32_t i = 0; i < ele_count; i++) {
 			if (! map_is_key(next_b, (uint32_t)(end - next_b))) {
-				cf_atomic32_incr(&bc->cdt_map.invalid_key);
+				cf_atomic32_incr(&st->invalid_key);
 				return NULL;
 			}
 
-			if ((next_b = check_map_keys_internal(next_b, end, bc)) == NULL) {
-				cf_atomic32_incr(&bc->cdt_map.corrupt);
+			next_b = check_map_keys_internal(next_b, end, st, level + 1);
+
+			if (next_b == NULL) {
 				return NULL;
 			}
 
-			if ((next_b = check_map_keys_internal(next_b, end, bc)) == NULL) {
-				cf_atomic32_incr(&bc->cdt_map.corrupt);
+			next_b = check_map_keys_internal(next_b, end, st, level + 1);
+
+			if (next_b == NULL) {
 				return NULL;
 			}
 		}
@@ -384,20 +407,27 @@ check_map_keys_internal(const uint8_t *b, const uint8_t *end, backup_config *bc)
 static bool
 cdt_check_map_keys_recursive(const uint8_t *buf, uint32_t sz, backup_config *bc)
 {
-	switch (msgpack_buf_peek_type(buf, sz)) {
+	msgpack_type type = msgpack_buf_peek_type(buf, sz);
+	cdt_stats *stats = NULL;
+
+	switch (type) {
 	case MSGPACK_TYPE_LIST:
-		cf_atomic32_incr(&bc->cdt_list.top_count);
-		cf_atomic32_incr(&bc->cdt_list.count);
+		stats = &bc->cdt_list;
 		break;
 	case MSGPACK_TYPE_MAP:
-		cf_atomic32_incr(&bc->cdt_map.top_count);
-		cf_atomic32_incr(&bc->cdt_map.count);
+		stats = &bc->cdt_map;
 		break;
 	default:
 		return false;
 	}
 
-	return check_map_keys_internal(buf, buf + sz, bc) == NULL;
+	cf_atomic32_incr(&stats->top_count);
+
+	if (check_map_keys_internal(buf, buf + sz, stats, 0) == NULL) {
+		return true;
+	}
+
+	return false;
 }
 
 // Return true to log the record.
@@ -425,7 +455,7 @@ cdt_check_map_keys(aerospike *as, as_record *rec, backup_config *bc)
 		uint32_t buf_sz = as_bytes_size(b);
 		bool check = cdt_check_map_keys_recursive(buf, buf_sz, bc);
 
-		if (! check) {
+		if (check) {
 			need_log = true;
 		}
 	}
@@ -762,13 +792,16 @@ counter_thread_func(void *cont)
 		err_code("Error while writing machine-readable summary");
 	}
 
-	inf("CDT States");
-	inf("%10u Lists", conf->cdt_list.count);
-	inf("%10u   Top-level Count", conf->cdt_list.top_count);
+	inf("CDT bin(s):");
+	inf("%10u Lists (top)", conf->cdt_list.top_count);
+	inf("%10u   Lists (sub)", conf->cdt_list.list_count);
+	inf("%10u   Maps (sub)", conf->cdt_list.map_count);
 	inf("%10u   Corrupted", conf->cdt_list.corrupt);
-
-	inf("%10u Maps", conf->cdt_map.count);
-	inf("%10u   Top-level Count", conf->cdt_map.top_count);
+	inf("%10u   Invalid-key", conf->cdt_list.invalid_key);
+	inf("");
+	inf("%10u Maps (top)", conf->cdt_map.top_count);
+	inf("%10u   Lists (sub)", conf->cdt_map.list_count);
+	inf("%10u   Maps (sub)", conf->cdt_map.map_count);
 	inf("%10u   Corrupted", conf->cdt_map.corrupt);
 	inf("%10u   Invalid-key", conf->cdt_map.invalid_key);
 

@@ -92,7 +92,7 @@ BACKUP_SRC := $(DIR_SRC)/backup.c $(DIR_SRC)/conf.c $(DIR_SRC)/utils.c $(DIR_SRC
 BACKUP_OBJ := $(call src_to_obj, $(BACKUP_SRC))
 BACKUP_DEP := $(call obj_to_dep, $(BACKUP_OBJ))
 
-BACKUP := $(DIR_BIN)/asvalidation
+BACKUP := $(DIR_BIN)/asmapkeycheck
 TOML := $(DIR_TOML)/libtoml.a
 
 INCS := $(BACKUP_INC)

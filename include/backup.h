@@ -61,9 +61,10 @@ typedef struct {
 
 typedef struct cdt_stats_s {
 	cf_atomic32 top_count;
-	cf_atomic32 count;
+	cf_atomic32 list_count;
+	cf_atomic32 map_count;
 	cf_atomic32 corrupt;
-	cf_atomic32 invalid_key; // map only
+	cf_atomic32 invalid_key;
 } cdt_stats;
 
 ///
