@@ -798,7 +798,7 @@ counter_thread_func(void *cont)
 	inf("%10u   Maps (sub)", conf->cdt_list.map_count);
 	inf("%10u   Corrupted", conf->cdt_list.corrupt);
 	inf("%10u   Invalid-key", conf->cdt_list.invalid_key);
-	inf("");
+	inf(" ");
 	inf("%10u Maps (top)", conf->cdt_map.top_count);
 	inf("%10u   Lists (sub)", conf->cdt_map.list_count);
 	inf("%10u   Maps (sub)", conf->cdt_map.map_count);

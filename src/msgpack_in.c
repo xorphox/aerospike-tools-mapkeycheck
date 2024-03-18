@@ -41,7 +41,7 @@
 //
 
 #define cf_warning(...)
-#define cf_assert(...)
+#define cf_assert(x, ...) ((void)x)
 #define cf_crash(...)
 
 #define CMP_EXT_TYPE 0xFF
